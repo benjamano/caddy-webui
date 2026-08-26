@@ -1,0 +1,11 @@
+{
+  "caddyfile_path": "/etc/caddy/Caddyfile",
+  "backup_dir": "/etc/caddy/caddyfile-backups",
+  "listen_host": "127.0.0.1",
+  "listen_port": 8080,
+  "password_salt": "REPLACE_ME_RUN_set-password",
+  "password_hash": "REPLACE_ME_RUN_set-password",
+  "password_iterations": 200000,
+  "reload_cmd": ["/usr/bin/caddy", "reload", "--config", "/etc/caddy/Caddyfile", "--force"],
+  "caddy_bin": "/usr/bin/caddy"
+}

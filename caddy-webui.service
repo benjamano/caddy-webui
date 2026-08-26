@@ -1,0 +1,21 @@
+[Unit]
+Description=Caddy Web UI
+After=network.target caddy.service
+Wants=caddy.service
+
+[Service]
+Type=simple
+User=caddy
+Group=caddy
+Environment=CADDY_WEBUI_CONFIG=/etc/caddy-webui/config.json
+ExecStart=/usr/bin/python3 /opt/caddy-webui/app.py
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/caddy
+
+[Install]
+WantedBy=multi-user.target

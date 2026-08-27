@@ -132,6 +132,17 @@ def split_prefix_address(chunk):
         prefix, addr = chunk[: last_blank.end()], chunk[last_blank.end():]
     else:
         prefix, addr = "", chunk
+    # Leading comment lines belong to the prefix, not to the address. A comment
+    # sitting directly above a site address is ordinary Caddyfile style, but
+    # without this the '#' check below rejects the whole chunk and the block
+    # disappears from the UI entirely (it becomes an unrecognised text segment).
+    lines = addr.split("\n")
+    keep = 0
+    while keep < len(lines) - 1 and (not lines[keep].strip() or lines[keep].lstrip().startswith("#")):
+        keep += 1
+    if keep:
+        prefix += "\n".join(lines[:keep]) + "\n"
+        addr = "\n".join(lines[keep:])
     if "#" in addr or not addr.strip():
         return None, None
     if not ADDRESS_RE.match(addr.strip()):

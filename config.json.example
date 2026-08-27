@@ -7,5 +7,6 @@
   "password_hash": "REPLACE_ME_RUN_set-password",
   "password_iterations": 200000,
   "reload_cmd": ["/usr/bin/caddy", "reload", "--config", "/etc/caddy/Caddyfile", "--force"],
-  "caddy_bin": "/usr/bin/caddy"
+  "caddy_bin": "/usr/bin/caddy",
+  "cookie_secure": false
 }

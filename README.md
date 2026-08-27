@@ -15,10 +15,21 @@ braces, comments inside the block — is shown read-only as a "custom" block
 and is preserved byte-for-byte on every save. The tool never rewrites config
 it doesn't fully understand.
 
+Only the route you actually add, edit, disable, or delete is rewritten —
+every other block (including ones with unusual indentation or hand-written
+formatting) is replayed byte-for-byte on that save, not just preserved in
+theory. A route can also be **disabled** without deleting it: this comments
+the whole block out under a `# caddy-webui:disabled` marker, so Caddy simply
+stops seeing it; re-enabling restores it exactly. New routes are inserted
+right after the last existing route, not always at the very end of the file.
+
 Every save: writes to a temp file → `caddy validate --config <tmp> --adapter
 caddyfile` → only on success, backs up the current Caddyfile with a
 timestamp, atomically replaces it, then runs `caddy reload`. If validation
-fails, nothing on disk changes and the error is shown in the UI.
+fails, nothing on disk changes and the error is shown in the UI. Past
+backups can be browsed and restored from the **Backups** page in the UI —
+restoring goes through the same validate-then-backup-then-replace path, so a
+bad restore is exactly as recoverable as a bad save.
 
 ## Quickstart (deploy to your own Caddy host)
 
@@ -46,9 +57,17 @@ packages required.
      "listen_host": "127.0.0.1",
      "listen_port": 8080,
      "reload_cmd": ["/usr/bin/caddy", "reload", "--config", "/etc/caddy/Caddyfile", "--force"],
-     "caddy_bin": "/usr/bin/caddy"
+     "caddy_bin": "/usr/bin/caddy",
+     "cookie_secure": false
    }
    ```
+
+   Set `cookie_secure` to `true` if this will only ever be reached over
+   HTTPS (e.g. proxied through Caddy itself with `tls internal`, see step 7)
+   — it adds the `Secure` flag to the session cookie. Leave it `false` if
+   you'll ever access it over plain HTTP (e.g. the SSH tunnel method below),
+   since browsers silently drop `Secure` cookies sent over HTTP and you'd
+   get stuck on the login page.
 
 4. **Set the admin password** (this fills in `password_salt`/`password_hash`
    in the config file — pick whatever OS user will actually run the service,
@@ -111,8 +130,11 @@ sudo systemctl restart caddy-webui   # restarting clears all sessions
 
 ## Rollback
 
-If a save ever produces something wrong (shouldn't happen — validation runs
-first) or you just want to revert:
+The easiest way is the **Backups** page in the UI — it lists every backup
+(newest first) with a Restore button. Restoring validates the backup first
+and backs up the current file before replacing it, same as any other save.
+
+If the UI itself is unreachable, you can still do it by hand:
 
 ```
 ls -lt /etc/caddy/caddyfile-backups/       # find the timestamp you want
@@ -127,6 +149,16 @@ scp app.py user@host:/tmp/app.py
 ssh user@host 'sudo cp /tmp/app.py /opt/caddy-webui/app.py && sudo chown caddy:caddy /opt/caddy-webui/app.py && sudo systemctl restart caddy-webui'
 ```
 
+## Running the tests
+
+```
+python3 test_parse.py
+```
+
+Stdlib only, no framework. Covers the parser (including comment handling,
+disable/enable round-tripping, and byte-exact preservation of untouched
+routes) and the backup list/restore functions.
+
 ## Known limitations
 
 - Single shared password, in-memory sessions (a restart logs everyone out).
@@ -135,5 +167,7 @@ ssh user@host 'sudo cp /tmp/app.py /opt/caddy-webui/app.py && sudo chown caddy:c
   (e.g. a Caddy `basic_auth` layer) if you add a public route to it.
 - Multi-host addresses (comma-separated) are supported as a single opaque
   address string, editable as one field.
-- New routes are always appended at the end of the file, not near related
-  blocks.
+- Disabling then re-enabling a route re-normalises its formatting to the
+  tool's own 4-space style (it no longer replays the original bytes, since
+  the route was rewritten into a comment and back) — cosmetic only, but
+  worth knowing if you're diffing Caddyfile backups.

@@ -34,6 +34,17 @@ SESSIONS = set()
 
 ADDRESS_RE = re.compile(r"^[A-Za-z0-9_.\-:*,\s\$\{\}/]+$")
 
+# Marker line written above a "disabled" route. Reserved for this tool's own
+# use -- see try_parse_disabled_block().
+DISABLED_MARKER = "# caddy-webui:disabled"
+
+# Backup filenames this tool ever writes (see save_document). Restore only
+# ever accepts a name matching this, both to avoid path traversal and to
+# avoid restoring an arbitrary file that just happens to live in that dir.
+# The optional "-N" suffix disambiguates two saves within the same second
+# (timestamp has 1-second resolution) -- see _unique_backup_path().
+BACKUP_NAME_RE = re.compile(r"^Caddyfile\.\d{8}-\d{6}(-\d+)?$")
+
 
 # ---------------------------------------------------------------------------
 # Config / auth
@@ -83,6 +94,7 @@ def cmd_set_password():
     cfg.setdefault("listen_port", 8080)
     cfg.setdefault("reload_cmd", ["systemctl", "reload", "caddy"])
     cfg.setdefault("caddy_bin", "caddy")
+    cfg.setdefault("cookie_secure", False)
 
     os.makedirs(os.path.dirname(config_path) or ".", exist_ok=True)
     with open(config_path, "w", encoding="utf-8") as f:
@@ -105,6 +117,14 @@ def cmd_set_password():
 # braces, comments inside the body, multiple directives) is preserved as an
 # opaque, read-only block. This is deliberate: the tool must never rewrite
 # config it doesn't fully understand.
+#
+# A "disabled_managed" segment is a managed route that has been switched off
+# through the UI: it's written back as a `DISABLED_MARKER` line followed by
+# the whole block re-commented, so it round-trips through plain-text editors
+# and `caddy validate` alike (a commented-out block is just not seen by
+# Caddy). It's only ever recognised on read if it decodes back to exactly
+# one clean managed block -- anything that doesn't match byte-for-byte is
+# left alone as ordinary text, never guessed at.
 # ---------------------------------------------------------------------------
 
 def _skip_comment_or_string(text, i, n):
@@ -166,12 +186,69 @@ def try_parse_managed(body):
     return None
 
 
+def try_parse_disabled_block(text, marker_start, n):
+    """text[marker_start:] begins with DISABLED_MARKER (caller already
+    checked). If the contiguous run of comment lines that follows decodes
+    to exactly one clean managed block, return (segment, end_index).
+    Otherwise return (None, None) and the caller treats the marker line as
+    an ordinary comment, preserving it byte-for-byte like any other text."""
+    line_end = text.find("\n", marker_start)
+    body_start = n if line_end == -1 else line_end + 1
+    k = body_start
+    while k < n:
+        nl = text.find("\n", k)
+        line_end_incl = n if nl == -1 else nl + 1
+        if text[k:line_end_incl].lstrip().startswith("#"):
+            k = line_end_incl
+            continue
+        break
+    span = text[body_start:k]
+    if not span.strip():
+        return None, None
+
+    decoded_lines = []
+    for line in span.splitlines():
+        rest = line.lstrip()[1:]  # drop the leading '#'
+        if rest.startswith(" "):
+            rest = rest[1:]
+        decoded_lines.append(rest)
+    decoded = "\n".join(decoded_lines) + "\n"
+
+    sub_doc = parse_document(decoded)
+    if not sub_doc or sub_doc[0]["kind"] != "managed":
+        return None, None
+    # Anything after the managed block itself must be pure trailing
+    # whitespace (the "\n" every block naturally ends with) -- any other
+    # leftover content means this wasn't a clean single block and must not
+    # be guessed at.
+    if any(s["kind"] != "text" or s["raw"].strip() for s in sub_doc[1:]):
+        return None, None
+    if render_document(sub_doc) != decoded:
+        return None, None
+
+    seg = dict(sub_doc[0])
+    seg["kind"] = "disabled_managed"
+    seg.pop("raw", None)
+    return seg, k
+
+
 def parse_document(text):
     segments = []
     n = len(text)
     i = 0
     text_start = 0
     while i < n:
+        if text[i] == "#":
+            line_end = text.find("\n", i)
+            line = text[i: n if line_end == -1 else line_end]
+            if line.rstrip("\r") == DISABLED_MARKER:
+                seg, consumed_end = try_parse_disabled_block(text, i, n)
+                if seg is not None:
+                    seg["prefix"] = text[text_start:i]
+                    segments.append(seg)
+                    text_start = consumed_end
+                    i = consumed_end
+                    continue
         skip_to = _skip_comment_or_string(text, i, n)
         if skip_to is not None:
             i = skip_to
@@ -200,15 +277,15 @@ def parse_document(text):
             body = text[i + 1:close_pos]
             addr, prefix = split_prefix_address(chunk)
             if addr is not None:
+                raw = chunk[len(prefix):] + "{" + body + "}"
                 managed = try_parse_managed(body)
                 if managed is not None:
                     matcher, upstream = managed
                     segments.append({
-                        "kind": "managed", "prefix": prefix,
+                        "kind": "managed", "prefix": prefix, "raw": raw,
                         "address": addr.strip(), "matcher": matcher, "upstream": upstream,
                     })
                 else:
-                    raw = chunk[len(prefix):] + "{" + body + "}"
                     segments.append({"kind": "opaque", "prefix": prefix, "raw": raw})
             else:
                 segments.append({"kind": "text", "raw": chunk + "{" + body + "}"})
@@ -225,6 +302,17 @@ def render_segment(s):
     if s["kind"] == "text":
         return s["raw"]
     if s["kind"] == "opaque":
+        return s["prefix"] + s["raw"]
+    if s["kind"] == "disabled_managed":
+        inner = (f"reverse_proxy {s['matcher']} {s['upstream']}" if s["matcher"]
+                 else f"reverse_proxy {s['upstream']}")
+        lines = [f"{s['address']} {{", f"    {inner}", "}"]
+        commented = "\n".join("# " + l for l in lines)
+        return f"{s['prefix']}{DISABLED_MARKER}\n{commented}\n"
+    # managed: replay the original bytes untouched unless this segment was
+    # actually created or edited this request (no "raw" in that case) --
+    # otherwise every save would re-normalise every other route's spacing.
+    if "raw" in s:
         return s["prefix"] + s["raw"]
     inner = (f"reverse_proxy {s['matcher']} {s['upstream']}" if s["matcher"]
              else f"reverse_proxy {s['upstream']}")
@@ -283,6 +371,22 @@ def reload_caddy(cfg):
     return True, ""
 
 
+def _unique_backup_path(backup_dir, ts):
+    """Path for a new backup at timestamp ts, disambiguated with a -N suffix
+    if a save already happened in this same second (the timestamp only has
+    1-second resolution) -- two saves close together must never silently
+    overwrite one another's backup."""
+    base = os.path.join(backup_dir, f"Caddyfile.{ts}")
+    if not os.path.exists(base):
+        return base
+    n = 1
+    while True:
+        candidate = os.path.join(backup_dir, f"Caddyfile.{ts}-{n}")
+        if not os.path.exists(candidate):
+            return candidate
+        n += 1
+
+
 def save_document(cfg, new_text):
     caddyfile_path = cfg["caddyfile_path"]
     target_dir = os.path.dirname(caddyfile_path) or "."
@@ -300,7 +404,7 @@ def save_document(cfg, new_text):
         os.makedirs(backup_dir, exist_ok=True)
         if os.path.exists(caddyfile_path):
             ts = time.strftime("%Y%m%d-%H%M%S")
-            shutil.copy2(caddyfile_path, os.path.join(backup_dir, f"Caddyfile.{ts}"))
+            shutil.copy2(caddyfile_path, _unique_backup_path(backup_dir, ts))
 
         os.replace(tmp_path, caddyfile_path)
         tmp_path = None  # already moved
@@ -316,6 +420,42 @@ def save_document(cfg, new_text):
                 os.remove(tmp_path)
             except OSError:
                 pass
+
+
+def list_backups(cfg):
+    backup_dir = cfg.get("backup_dir")
+    if not backup_dir or not os.path.isdir(backup_dir):
+        return []
+    entries = []
+    for name in os.listdir(backup_dir):
+        if not BACKUP_NAME_RE.match(name):
+            continue
+        full = os.path.join(backup_dir, name)
+        try:
+            st = os.stat(full)
+        except OSError:
+            continue
+        entries.append({"name": name, "mtime": st.st_mtime, "size": st.st_size})
+    entries.sort(key=lambda e: (e["mtime"], e["name"]), reverse=True)
+    return entries
+
+
+def restore_backup(cfg, name):
+    """Restore a previous backup. Goes through save_document, so the restore
+    itself is validated first and the file it replaces is backed up too --
+    a bad restore is exactly as recoverable as a bad save."""
+    if not BACKUP_NAME_RE.match(name or ""):
+        return False, "Invalid backup name."
+    backup_dir = cfg.get("backup_dir") or ""
+    src = os.path.join(backup_dir, name)
+    if not backup_dir or not os.path.isfile(src):
+        return False, "Backup not found."
+    with open(src, "r", encoding="utf-8") as f:
+        content = f.read()
+    ok, msg = save_document(cfg, content)
+    if ok:
+        return True, f"Restored {name}."
+    return False, msg
 
 
 def validate_form(address, upstream):
@@ -346,6 +486,7 @@ PAGE = """<!doctype html>
   --warn-bg: #fffbeb; --warn-border: #f5deA0; --warn-text: #92400e;
   --badge-managed-bg: #eff6ff; --badge-managed-text: #1e40af;
   --badge-custom-bg: #fffbeb; --badge-custom-text: #92400e;
+  --badge-disabled-bg: #f3f4f6; --badge-disabled-text: #4b5563;
   --radius: 12px; --shadow: 0 1px 3px rgba(16,24,40,0.06);
 }}
 @media (prefers-color-scheme: dark) {{
@@ -358,6 +499,7 @@ PAGE = """<!doctype html>
     --warn-bg: #2a2110; --warn-border: #78350f; --warn-text: #fcd34d;
     --badge-managed-bg: #17253f; --badge-managed-text: #93c5fd;
     --badge-custom-bg: #332912; --badge-custom-text: #fcd34d;
+    --badge-disabled-bg: #23262c; --badge-disabled-text: #9aa1ac;
     --shadow: 0 1px 3px rgba(0,0,0,0.4);
   }}
 }}
@@ -369,6 +511,7 @@ body {{
 }}
 .container {{ max-width: 620px; margin: 0 auto; }}
 .topbar {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem; gap: 0.75rem; }}
+.topbar-links {{ display: flex; gap: 0.9rem; align-items: center; }}
 h1 {{ font-size: 1.25rem; margin: 0; font-weight: 700; }}
 h1 .accent {{ color: var(--primary); }}
 a {{ color: var(--primary); }}
@@ -379,10 +522,12 @@ a {{ color: var(--primary); }}
 .banner.err {{ background: var(--error-bg); border-color: var(--error-border); color: var(--error-text); }}
 .banner.warn {{ background: var(--warn-bg); border-color: var(--warn-border); color: var(--warn-text); }}
 .card {{ background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); padding: 1rem 1.1rem; margin-bottom: 0.7rem; }}
+.card.disabled-card {{ opacity: 0.72; }}
 .card-top {{ display: flex; justify-content: space-between; align-items: flex-start; gap: 0.6rem; }}
 .address {{ font-weight: 600; font-size: 1.02rem; word-break: break-word; }}
 .badge {{ flex: none; font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; padding: 0.2rem 0.5rem; border-radius: 999px; background: var(--badge-managed-bg); color: var(--badge-managed-text); white-space: nowrap; }}
 .badge.custom {{ background: var(--badge-custom-bg); color: var(--badge-custom-text); }}
+.badge.disabled {{ background: var(--badge-disabled-bg); color: var(--badge-disabled-text); }}
 .detail {{ color: var(--text-muted); font-size: 0.88rem; margin-top: 0.3rem; word-break: break-word; }}
 .detail code {{ background: var(--bg); border-radius: 5px; padding: 0.1rem 0.35rem; font-size: 0.85rem; color: var(--text); }}
 .card-actions {{ margin-top: 0.8rem; display: flex; gap: 0.5rem; flex-wrap: wrap; }}
@@ -455,6 +600,29 @@ def render_index(qs, doc):
   <div class="detail">{detail}</div>
   <div class="card-actions">
     <a class="btn" href="/edit?id={idx}">Edit</a>
+    <form class="inline" method="post" action="/disable?id={idx}">
+      <button type="submit" class="btn">Disable</button>
+    </form>
+    <form class="inline" method="post" action="/delete?id={idx}" onsubmit="return confirm('Delete this route?');">
+      <button type="submit" class="btn btn-danger">Delete</button>
+    </form>
+  </div>
+</div>""")
+        elif s["kind"] == "disabled_managed":
+            detail = f'<code>{html.escape(s["upstream"])}</code>'
+            if s["matcher"]:
+                detail = f'{html.escape(s["matcher"])} &rarr; ' + detail
+            cards.append(f"""<div class="card disabled-card">
+  <div class="card-top">
+    <div class="address">{html.escape(s['address'])}</div>
+    <span class="badge disabled">disabled</span>
+  </div>
+  <div class="detail">{detail}</div>
+  <div class="card-actions">
+    <a class="btn" href="/edit?id={idx}">Edit</a>
+    <form class="inline" method="post" action="/enable?id={idx}">
+      <button type="submit" class="btn btn-primary">Enable</button>
+    </form>
     <form class="inline" method="post" action="/delete?id={idx}" onsubmit="return confirm('Delete this route?');">
       <button type="submit" class="btn btn-danger">Delete</button>
     </form>
@@ -473,7 +641,9 @@ def render_index(qs, doc):
     list_html = "".join(cards) if cards else '<div class="card empty">No routes found.</div>'
 
     body = f"""
-<div class="topbar"><h1>Caddy <span class="accent">Web UI</span></h1><a class="link-muted" href="/logout">Log out</a></div>
+<div class="topbar"><h1>Caddy <span class="accent">Web UI</span></h1>
+<div class="topbar-links"><a class="link-muted" href="/backups">Backups</a><a class="link-muted" href="/logout">Log out</a></div>
+</div>
 {warn}
 {flash}
 {list_html}
@@ -489,10 +659,14 @@ def render_form(idx, seg, err):
     address = html.escape(seg["address"]) if seg else ""
     matcher = html.escape(seg["matcher"] or "") if seg else ""
     upstream = html.escape(seg["upstream"]) if seg else ""
+    disabled_note = ""
+    if seg is not None and seg.get("kind") == "disabled_managed":
+        disabled_note = '<div class="banner warn">This route is disabled. Saving keeps it disabled -- use Enable on the main page to turn it back on.</div>'
     err_html = f'<div class="banner err">{html.escape(err)}</div>' if err else ""
     body = f"""
 <div class="topbar"><h1>{title}</h1></div>
 {err_html}
+{disabled_note}
 <div class="card">
 <form method="post" action="{action}">
   <label>Address <span class="hint">e.g. app.example.com</span></label>
@@ -507,6 +681,42 @@ def render_form(idx, seg, err):
   </div>
 </form>
 </div>
+"""
+    return PAGE.format(body=body)
+
+
+def render_backups(cfg, qs):
+    msg = qs.get("msg", [""])[0]
+    err = qs.get("err", [""])[0]
+    flash = ""
+    if msg:
+        flash += f'<div class="banner msg">{html.escape(msg)}</div>'
+    if err:
+        flash += f'<div class="banner err">{html.escape(err)}</div>'
+
+    entries = list_backups(cfg)
+    cards = []
+    for e in entries:
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(e["mtime"]))
+        size = f"{e['size'] / 1024:.1f} KB" if e["size"] >= 1024 else f"{e['size']} B"
+        cards.append(f"""<div class="card">
+  <div class="card-top">
+    <div class="address">{html.escape(when)}</div>
+  </div>
+  <div class="detail">{html.escape(e['name'])} &middot; {size}</div>
+  <div class="card-actions">
+    <form class="inline" method="post" action="/restore" onsubmit="return confirm('Restore this backup? Your current Caddyfile will be backed up first.');">
+      <input type="hidden" name="name" value="{html.escape(e['name'])}">
+      <button type="submit" class="btn btn-danger">Restore</button>
+    </form>
+  </div>
+</div>""")
+    list_html = "".join(cards) if cards else '<div class="card empty">No backups yet -- one is made automatically before every save.</div>'
+
+    body = f"""
+<div class="topbar"><h1>Backups</h1><a class="link-muted" href="/">&larr; Back</a></div>
+{flash}
+{list_html}
 """
     return PAGE.format(body=body)
 
@@ -582,9 +792,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/edit":
             doc = parse_document(read_caddyfile(cfg))
             idx = int(qs.get("id", ["-1"])[0])
-            if idx < 0 or idx >= len(doc) or doc[idx]["kind"] != "managed":
+            if idx < 0 or idx >= len(doc) or doc[idx]["kind"] not in ("managed", "disabled_managed"):
                 return self._redirect("/?err=" + urllib.parse.quote("Invalid route"))
             return self._send_html(render_form(idx, doc[idx], qs.get("err", [""])[0]))
+
+        if path == "/backups":
+            return self._send_html(render_backups(cfg, qs))
 
         return self._send_html("Not found", 404)
 
@@ -598,13 +811,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if verify_password(cfg, form.get("password", "")):
                 token = secrets.token_hex(32)
                 SESSIONS.add(token)
-                return self._redirect("/", [("Set-Cookie", f"session={token}; Path=/; HttpOnly; SameSite=Strict")])
+                secure = "; Secure" if cfg.get("cookie_secure") else ""
+                cookie = f"session={token}; Path=/; HttpOnly; SameSite=Strict{secure}"
+                return self._redirect("/", [("Set-Cookie", cookie)])
             return self._redirect("/login?err=" + urllib.parse.quote("Invalid password"))
 
         if not self._authed():
             return self._redirect("/login")
 
         cfg = load_config()
+
+        if path == "/restore":
+            form = self._read_form()
+            ok, msg = restore_backup(cfg, form.get("name", ""))
+            if ok:
+                return self._redirect("/backups?msg=" + urllib.parse.quote(msg))
+            return self._redirect("/backups?err=" + urllib.parse.quote(msg))
+
         form = self._read_form()
         doc = parse_document(read_caddyfile(cfg))
 
@@ -615,13 +838,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             err = validate_form(address, upstream)
             if err:
                 return self._redirect("/new?err=" + urllib.parse.quote(err))
-            doc.append({"kind": "managed", "prefix": "\n", "address": address,
-                        "matcher": matcher, "upstream": upstream})
+            new_seg = {"kind": "managed", "prefix": "\n\n", "address": address,
+                       "matcher": matcher, "upstream": upstream}
+            # Insert right after the last existing route, rather than always
+            # at the very end of the file (which can land after unrelated
+            # trailing custom blocks). Falls back to appending if this is
+            # the first route in the file.
+            insert_at = len(doc)
+            for j in range(len(doc) - 1, -1, -1):
+                if doc[j]["kind"] in ("managed", "disabled_managed"):
+                    insert_at = j + 1
+                    break
+            doc.insert(insert_at, new_seg)
             return self._apply(cfg, doc)
 
         if path == "/edit":
             idx = int(qs.get("id", ["-1"])[0])
-            if idx < 0 or idx >= len(doc) or doc[idx]["kind"] != "managed":
+            if idx < 0 or idx >= len(doc) or doc[idx]["kind"] not in ("managed", "disabled_managed"):
                 return self._redirect("/?err=" + urllib.parse.quote("Invalid route"))
             address = form.get("address", "").strip()
             matcher = form.get("matcher", "").strip() or None
@@ -629,12 +862,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
             err = validate_form(address, upstream)
             if err:
                 return self._redirect(f"/edit?id={idx}&err=" + urllib.parse.quote(err))
-            doc[idx].update({"address": address, "matcher": matcher, "upstream": upstream})
+            doc[idx]["address"] = address
+            doc[idx]["matcher"] = matcher
+            doc[idx]["upstream"] = upstream
+            doc[idx].pop("raw", None)
+            return self._apply(cfg, doc)
+
+        if path == "/disable":
+            idx = int(qs.get("id", ["-1"])[0])
+            if idx < 0 or idx >= len(doc) or doc[idx]["kind"] != "managed":
+                return self._redirect("/?err=" + urllib.parse.quote("Invalid route"))
+            doc[idx]["kind"] = "disabled_managed"
+            doc[idx].pop("raw", None)
+            return self._apply(cfg, doc)
+
+        if path == "/enable":
+            idx = int(qs.get("id", ["-1"])[0])
+            if idx < 0 or idx >= len(doc) or doc[idx]["kind"] != "disabled_managed":
+                return self._redirect("/?err=" + urllib.parse.quote("Invalid route"))
+            doc[idx]["kind"] = "managed"
+            doc[idx].pop("raw", None)
             return self._apply(cfg, doc)
 
         if path == "/delete":
             idx = int(qs.get("id", ["-1"])[0])
-            if idx < 0 or idx >= len(doc) or doc[idx]["kind"] != "managed":
+            if idx < 0 or idx >= len(doc) or doc[idx]["kind"] not in ("managed", "disabled_managed"):
                 return self._redirect("/?err=" + urllib.parse.quote("Invalid route"))
             prefix = doc[idx].get("prefix", "")
             if prefix:

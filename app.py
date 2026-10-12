@@ -460,15 +460,23 @@ def save_document(cfg, new_text):
 
         backup_dir = cfg.get("backup_dir") or os.path.join(target_dir, "caddyfile-backups")
         os.makedirs(backup_dir, exist_ok=True)
+        backup_path = None
         if os.path.exists(caddyfile_path):
             ts = time.strftime("%Y%m%d-%H%M%S")
-            shutil.copy2(caddyfile_path, _unique_backup_path(backup_dir, ts))
+            backup_path = _unique_backup_path(backup_dir, ts)
+            shutil.copy2(caddyfile_path, backup_path)
 
         os.replace(tmp_path, caddyfile_path)
         tmp_path = None  # already moved
 
         ok2, msg2 = reload_caddy(cfg)
         if not ok2:
+            # A failed reload leaves Caddy running the old config, so put the
+            # old file back too -- otherwise disk and the running server drift
+            # apart and the next restart would fail on the bad config.
+            if backup_path:
+                shutil.copy2(backup_path, caddyfile_path)
+                return False, f"Caddy rejected the change, so nothing was changed:\n{msg2}"
             return False, f"Saved, but reload failed:\n{msg2}\nCheck the caddy service; you may need to reload it manually."
         note = f" ({msg})" if msg else ""
         return True, f"Saved and reloaded Caddy.{note}"
@@ -525,6 +533,9 @@ def normalize_listen(listen):
 def validate_tcp_form(listen, upstream, doc, skip_idx=None):
     if not LISTEN_RE.match(listen):
         return "Listen port is required, e.g. 25565 or :25565."
+    if re.sub(r"^tcp/", "", listen.rsplit(":", 1)[0]):
+        return ("Enter just the port, e.g. 25565. Caddy listens on this host; "
+                "the hostname belongs in DNS, not here.")
     port = int(listen.rsplit(":", 1)[1])
     if not 0 < port < 65536:
         return "Listen port must be between 1 and 65535."
@@ -779,7 +790,7 @@ def render_tcp_form(idx, srv, err):
 <div class="banner warn">Raw TCP proxying (caddy-l4). Caddy listens on the port below on this host and pipes every connection to the upstream &mdash; there's no hostname routing, so forward the port on your router to this host and point DNS at your public IP.</div>
 <div class="card">
 <form method="post" action="{action}">
-  <label>Listen port <span class="hint">e.g. 25565</span></label>
+  <label>Listen port <span class="hint">just the port, e.g. 25565 &mdash; no hostname</span></label>
   <input type="text" name="listen" value="{listen}" autocapitalize="off" autocorrect="off" inputmode="numeric" required>
   <label>Upstream <span class="hint">host:port, e.g. 192.168.1.115:25565</span></label>
   <input type="text" name="upstream" value="{upstream}" autocapitalize="off" autocorrect="off" required>

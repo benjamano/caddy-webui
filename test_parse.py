@@ -280,8 +280,28 @@ assert app.normalize_listen("25565") == ":25565"
 assert app.validate_tcp_form(":25565", "192.168.1.115:25565", []) is None
 assert app.validate_tcp_form(":25565", "192.168.1.115", []) is not None  # upstream needs a port
 assert app.validate_tcp_form(":443", "x:1", []) is not None
+assert app.validate_tcp_form("mc.example.com:25565", "x:1", []) is not None  # hostname, not a port
+assert app.validate_tcp_form("tcp/:25565", "x:1", []) is None
 assert app.validate_tcp_form(":99999", "x:1", []) is not None
 assert app.validate_tcp_form(":25565", "x:1", app.parse_document(L4)) is not None  # duplicate port
 assert app.validate_tcp_form(":25565", "x:1", app.parse_document(L4), skip_idx=0) is None
+
+# A rejected reload puts the previous Caddyfile back, so disk never drifts
+# from what Caddy is actually running.
+tmpdir = tempfile.mkdtemp()
+real_reload = app.reload_caddy
+try:
+    caddyfile_path = os.path.join(tmpdir, "Caddyfile")
+    with open(caddyfile_path, "w", encoding="utf-8") as f:
+        f.write("good\n")
+    cfg = {"caddyfile_path": caddyfile_path, "backup_dir": os.path.join(tmpdir, "b")}
+    app.reload_caddy = lambda cfg: (False, "bind: cannot assign requested address")
+    ok, msg = app.save_document(cfg, "bad\n")
+    assert not ok and "nothing was changed" in msg, msg
+    with open(caddyfile_path, encoding="utf-8") as f:
+        assert f.read() == "good\n"
+finally:
+    app.reload_caddy = real_reload
+    shutil.rmtree(tmpdir, ignore_errors=True)
 
 print("All parser tests passed.")

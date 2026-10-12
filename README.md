@@ -81,7 +81,15 @@ packages required.
 
    ```
    sudo mkdir -p /etc/caddy/caddyfile-backups
+   sudo chown caddy:caddy /etc/caddy/Caddyfile /etc/caddy/caddyfile-backups
+   sudo chown root:caddy /etc/caddy && sudo chmod 775 /etc/caddy
    ```
+
+   The app saves atomically by writing a temp file *next to* the Caddyfile
+   and renaming it over the original, so the service user needs write access
+   to `/etc/caddy` itself, not just the Caddyfile. (The Caddy package creates
+   that directory as `root:root 755`; without this every save fails with a
+   permission error.)
 
 6. **Install and start the systemd service.** `caddy-webui.service` runs the
    app as `User=caddy` — the same OS user Caddy's own systemd unit typically
@@ -120,6 +128,35 @@ packages required.
      or hostname) rather than a bare `:8443` — Caddy's internal CA needs an
      identifiable host to issue a certificate for, and a hostless address
      will fail the TLS handshake.
+
+## TCP routes (game servers, SSH, databases…)
+
+HTTP `reverse_proxy` can't carry non-HTTP protocols like Minecraft. For
+those, use **+ Add TCP route**: give a listen port and a `host:port`
+upstream, and Caddy pipes every connection on that port straight through.
+There's no hostname routing at this layer, so forward the port on your
+router to the Caddy host and point DNS at your public IP (DNS-only/grey
+cloud if you're on Cloudflare).
+
+These live in a `layer4 { ... }` block inside the Caddyfile's global
+options block, which needs the [caddy-l4](https://github.com/mholt/caddy-l4)
+module — the stock Caddy package doesn't include it, and a save will fail
+validation until it's installed. To swap in an official caddy-l4 build
+while keeping the apt package (and surviving `apt upgrade`):
+
+```
+curl -fsSL -o /tmp/caddy "https://caddyserver.com/api/download?os=linux&arch=amd64&p=github.com%2Fmholt%2Fcaddy-l4"
+sudo dpkg-divert --divert /usr/bin/caddy.default --rename /usr/bin/caddy
+sudo install -m 755 /tmp/caddy /usr/bin/caddy.custom
+sudo update-alternatives --install /usr/bin/caddy caddy /usr/bin/caddy.default 10
+sudo update-alternatives --install /usr/bin/caddy caddy /usr/bin/caddy.custom 50
+sudo systemctl restart caddy
+```
+
+Like site blocks, the global block is only managed when it contains nothing
+but plain `<port> { route { proxy <upstream> } }` servers. If your Caddyfile
+already has other global options, it's shown read-only and the UI won't add
+TCP routes to it — add the `layer4` block by hand.
 
 ## Changing the password
 

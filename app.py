@@ -232,6 +232,51 @@ def try_parse_disabled_block(text, marker_start, n):
     return seg, k
 
 
+# A layer4 (TCP) route is a caddy-l4 server living in the global options
+# block. The global block is only ever treated as managed when its body is
+# EXACTLY a `layer4 { ... }` block whose every server is the canonical
+#     <listen> { route { proxy <upstream> } }
+# shape -- anything else (other global options, matchers, comments) leaves
+# the global block opaque, same rule as for site blocks.
+LISTEN_RE = re.compile(r"^(tcp/)?([A-Za-z0-9.\-]*|\[[0-9A-Fa-f:.]+\]):\d{1,5}$")
+L4_UPSTREAM_RE = re.compile(r"^(tcp/)?([A-Za-z0-9.\-]+|\[[0-9A-Fa-f:.]+\]):\d{1,5}$")
+
+
+def try_parse_layer4(body):
+    """Return [{"listen", "upstream"}, ...] if body is a clean, canonical
+    layer4 block, else None."""
+    if "#" in body or '"' in body:
+        return None
+    t = re.sub(r"([{}])", r" \1 ", body).split()
+    if len(t) < 3 or t[:2] != ["layer4", "{"] or t[-1] != "}":
+        return None
+    inner = t[2:-1]
+    if len(inner) % 8 != 0:
+        return None
+    servers = []
+    for k in range(0, len(inner), 8):
+        listen, ob1, route, ob2, proxy, upstream, cb1, cb2 = inner[k:k + 8]
+        if (ob1, route, ob2, proxy, cb1, cb2) != ("{", "route", "{", "proxy", "}", "}"):
+            return None
+        if not LISTEN_RE.match(listen) or not L4_UPSTREAM_RE.match(upstream):
+            return None
+        servers.append({"listen": listen, "upstream": upstream})
+    return servers
+
+
+def render_layer4(servers):
+    parts = ["{\n\tlayer4 {\n"]
+    for srv in servers:
+        parts.append(f"\t\t{srv['listen']} {{\n\t\t\troute {{\n"
+                     f"\t\t\t\tproxy {srv['upstream']}\n\t\t\t}}\n\t\t}}\n")
+    parts.append("\t}\n}")
+    return "".join(parts)
+
+
+def _is_comment_only(chunk):
+    return all(not l.strip() or l.lstrip().startswith("#") for l in chunk.split("\n"))
+
+
 def parse_document(text):
     segments = []
     n = len(text)
@@ -276,7 +321,15 @@ def parse_document(text):
             chunk = text[text_start:i]
             body = text[i + 1:close_pos]
             addr, prefix = split_prefix_address(chunk)
-            if addr is not None:
+            if not segments and _is_comment_only(chunk):
+                # Global options block: only legal as the very first block.
+                servers = try_parse_layer4(body)
+                segments.append({
+                    "kind": "layer4" if servers is not None else "global",
+                    "prefix": chunk, "raw": "{" + body + "}",
+                    "servers": servers or [],
+                })
+            elif addr is not None:
                 raw = chunk[len(prefix):] + "{" + body + "}"
                 managed = try_parse_managed(body)
                 if managed is not None:
@@ -301,8 +354,13 @@ def parse_document(text):
 def render_segment(s):
     if s["kind"] == "text":
         return s["raw"]
-    if s["kind"] == "opaque":
+    if s["kind"] in ("opaque", "global"):
         return s["prefix"] + s["raw"]
+    if s["kind"] == "layer4":
+        if "raw" in s:
+            return s["prefix"] + s["raw"]
+        # Last TCP route deleted: drop the (now empty) global block entirely.
+        return s["prefix"] + (render_layer4(s["servers"]) if s["servers"] else "")
     if s["kind"] == "disabled_managed":
         inner = (f"reverse_proxy {s['matcher']} {s['upstream']}" if s["matcher"]
                  else f"reverse_proxy {s['upstream']}")
@@ -458,6 +516,36 @@ def restore_backup(cfg, name):
     return False, msg
 
 
+def normalize_listen(listen):
+    """Accept a bare port ("25565") as shorthand for ":25565"."""
+    listen = listen.strip()
+    return ":" + listen if listen.isdigit() else listen
+
+
+def validate_tcp_form(listen, upstream, doc, skip_idx=None):
+    if not LISTEN_RE.match(listen):
+        return "Listen port is required, e.g. 25565 or :25565."
+    port = int(listen.rsplit(":", 1)[1])
+    if not 0 < port < 65536:
+        return "Listen port must be between 1 and 65535."
+    if port in (80, 443):
+        return "Ports 80 and 443 are used by Caddy's HTTP routes."
+    if not L4_UPSTREAM_RE.match(upstream):
+        return "Upstream must include a port, e.g. 192.168.1.115:25565."
+    seg = find_layer4(doc)
+    for k, srv in enumerate(seg["servers"] if seg else []):
+        if k != skip_idx and srv["listen"].rsplit(":", 1)[1] == str(port):
+            return f"Port {port} already has a TCP route."
+    return None
+
+
+def find_layer4(doc):
+    for s in doc:
+        if s["kind"] == "layer4":
+            return s
+    return None
+
+
 def validate_form(address, upstream):
     if not address or not ADDRESS_RE.match(address):
         return "Address is required and may only contain host/port characters."
@@ -546,6 +634,8 @@ a {{ color: var(--primary); }}
 .btn-block {{ width: 100%; }}
 form.inline {{ display: inline; }}
 .add-link {{ display: block; margin-top: 1.1rem; }}
+.add-link-tcp {{ display: flex; margin-top: 0.6rem; }}
+.badge.tcp {{ background: var(--success-bg); color: var(--success-text); }}
 label {{ display: block; font-weight: 600; font-size: 0.9rem; margin: 1rem 0 0.35rem; }}
 label:first-of-type {{ margin-top: 0; }}
 .hint {{ color: var(--text-muted); font-weight: 400; font-size: 0.82rem; }}
@@ -628,6 +718,29 @@ def render_index(qs, doc):
     </form>
   </div>
 </div>""")
+        elif s["kind"] == "layer4":
+            for k, srv in enumerate(s["servers"]):
+                cards.append(f"""<div class="card">
+  <div class="card-top">
+    <div class="address">{html.escape(srv['listen'])}</div>
+    <span class="badge tcp">tcp</span>
+  </div>
+  <div class="detail"><code>{html.escape(srv['upstream'])}</code></div>
+  <div class="card-actions">
+    <a class="btn" href="/tcp/edit?id={k}">Edit</a>
+    <form class="inline" method="post" action="/tcp/delete?id={k}" onsubmit="return confirm('Delete this TCP route?');">
+      <button type="submit" class="btn btn-danger">Delete</button>
+    </form>
+  </div>
+</div>""")
+        elif s["kind"] == "global":
+            cards.append("""<div class="card">
+  <div class="card-top">
+    <div class="address">Global options</div>
+    <span class="badge custom">custom</span>
+  </div>
+  <div class="detail">Custom global options block &mdash; not editable here, preserved as-is on save.</div>
+</div>""")
         elif s["kind"] == "opaque":
             addr = opaque_address_preview(s["raw"])
             cards.append(f"""<div class="card">
@@ -648,6 +761,34 @@ def render_index(qs, doc):
 {flash}
 {list_html}
 <a class="btn btn-primary btn-block add-link" href="/new">+ Add route</a>
+<a class="btn btn-block add-link-tcp" href="/tcp/new">+ Add TCP route <span class="hint">(game servers, SSH, databases&hellip;)</span></a>
+"""
+    return PAGE.format(body=body)
+
+
+def render_tcp_form(idx, srv, err):
+    is_edit = idx is not None
+    title = "Edit TCP route" if is_edit else "Add TCP route"
+    action = f"/tcp/edit?id={idx}" if is_edit else "/tcp/new"
+    listen = html.escape(srv["listen"]) if srv else ""
+    upstream = html.escape(srv["upstream"]) if srv else ""
+    err_html = f'<div class="banner err">{html.escape(err)}</div>' if err else ""
+    body = f"""
+<div class="topbar"><h1>{title}</h1></div>
+{err_html}
+<div class="banner warn">Raw TCP proxying (caddy-l4). Caddy listens on the port below on this host and pipes every connection to the upstream &mdash; there's no hostname routing, so forward the port on your router to this host and point DNS at your public IP.</div>
+<div class="card">
+<form method="post" action="{action}">
+  <label>Listen port <span class="hint">e.g. 25565</span></label>
+  <input type="text" name="listen" value="{listen}" autocapitalize="off" autocorrect="off" inputmode="numeric" required>
+  <label>Upstream <span class="hint">host:port, e.g. 192.168.1.115:25565</span></label>
+  <input type="text" name="upstream" value="{upstream}" autocapitalize="off" autocorrect="off" required>
+  <div class="form-actions">
+    <button type="submit" class="btn btn-primary">Save</button>
+    <a class="btn" href="/">Cancel</a>
+  </div>
+</form>
+</div>
 """
     return PAGE.format(body=body)
 
@@ -796,6 +937,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._redirect("/?err=" + urllib.parse.quote("Invalid route"))
             return self._send_html(render_form(idx, doc[idx], qs.get("err", [""])[0]))
 
+        if path == "/tcp/new":
+            return self._send_html(render_tcp_form(None, None, qs.get("err", [""])[0]))
+
+        if path == "/tcp/edit":
+            seg = find_layer4(parse_document(read_caddyfile(cfg)))
+            idx = int(qs.get("id", ["-1"])[0])
+            if seg is None or not 0 <= idx < len(seg["servers"]):
+                return self._redirect("/?err=" + urllib.parse.quote("Invalid TCP route"))
+            return self._send_html(render_tcp_form(idx, seg["servers"][idx], qs.get("err", [""])[0]))
+
         if path == "/backups":
             return self._send_html(render_backups(cfg, qs))
 
@@ -868,6 +1019,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             doc[idx].pop("raw", None)
             return self._apply(cfg, doc)
 
+        if path in ("/tcp/new", "/tcp/edit", "/tcp/delete"):
+            return self._handle_tcp(cfg, doc, path, qs, form)
+
         if path == "/disable":
             idx = int(qs.get("id", ["-1"])[0])
             if idx < 0 or idx >= len(doc) or doc[idx]["kind"] != "managed":
@@ -897,8 +1051,49 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         return self._send_html("Not found", 404)
 
+    def _handle_tcp(self, cfg, doc, path, qs, form):
+        seg = find_layer4(doc)
+        idx = int(qs.get("id", ["-1"])[0]) if path != "/tcp/new" else None
+        if idx is not None and (seg is None or not 0 <= idx < len(seg["servers"])):
+            return self._redirect("/?err=" + urllib.parse.quote("Invalid TCP route"))
+
+        if path == "/tcp/delete":
+            del seg["servers"][idx]
+            seg.pop("raw", None)
+            return self._apply(cfg, doc)
+
+        listen = normalize_listen(form.get("listen", ""))
+        upstream = form.get("upstream", "").strip()
+        back = "/tcp/new" if idx is None else f"/tcp/edit?id={idx}"
+        err = validate_tcp_form(listen, upstream, doc, skip_idx=idx)
+        if err is None and seg is None and any(s["kind"] == "global" for s in doc):
+            err = ("This Caddyfile already has a custom global options block. "
+                   "Add the layer4 config to it by hand.")
+        if err:
+            return self._redirect(back + ("&" if "?" in back else "?") + "err=" + urllib.parse.quote(err))
+
+        if seg is None:
+            # The global options block must come first in a Caddyfile.
+            seg = {"kind": "layer4", "prefix": "", "servers": []}
+            doc[0:0] = [seg, {"kind": "text", "raw": "\n\n"}]
+        if idx is None:
+            seg["servers"].append({"listen": listen, "upstream": upstream})
+        else:
+            seg["servers"][idx] = {"listen": listen, "upstream": upstream}
+        seg.pop("raw", None)
+        return self._apply(cfg, doc)
+
     def _apply(self, cfg, doc):
-        ok, msg = save_document(cfg, render_document(doc))
+        try:
+            ok, msg = save_document(cfg, render_document(doc))
+        except PermissionError as e:
+            # Without this the request dies with no response, which the
+            # Caddy in front of the UI reports as a bare 502.
+            ok, msg = False, (f"Permission denied: {e.filename}\n"
+                              "The user running caddy-webui needs write access to the "
+                              "Caddyfile's directory (see README step 5).")
+        except Exception as e:
+            ok, msg = False, f"Save failed: {e}"
         if ok:
             return self._redirect("/?msg=" + urllib.parse.quote(msg))
         return self._redirect("/?err=" + urllib.parse.quote(msg))

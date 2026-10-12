@@ -234,4 +234,54 @@ try:
 finally:
     shutil.rmtree(tmpdir, ignore_errors=True)
 
+# ---------------------------------------------------------------------------
+# TCP (layer4) routes
+# ---------------------------------------------------------------------------
+
+L4 = ("# header\n{\n\tlayer4 {\n\t\t:25565 {\n\t\t\troute {\n\t\t\t\tproxy 192.168.1.115:25565\n"
+      "\t\t\t}\n\t\t}\n\t}\n}\n\n" + SIMPLE)
+doc = app.parse_document(L4)
+assert [s["kind"] for s in doc][:1] == ["layer4"], kinds(L4)
+assert doc[0]["servers"] == [{"listen": ":25565", "upstream": "192.168.1.115:25565"}], doc[0]
+assert "managed" in kinds(L4), kinds(L4)
+assert app.render_document(doc) == L4, "layer4: untouched round-trip changed the document"
+
+# Re-rendering the canonical form must reproduce the original bytes.
+doc[0].pop("raw")
+assert app.render_document(doc) == L4, app.render_document(doc)
+
+# Adding a second server and re-parsing keeps both.
+doc[0]["servers"].append({"listen": ":2222", "upstream": "10.0.0.5:22"})
+doc2 = app.parse_document(app.render_document(doc))
+assert len(doc2[0]["servers"]) == 2, doc2[0]
+
+# Deleting the last server drops the global block entirely.
+doc[0]["servers"] = []
+out = app.render_document(doc)
+assert "layer4" not in out and "# header" in out and "reverse_proxy" in out, out
+
+# A global block with anything else in it is never managed.
+OTHER_GLOBAL = "{\n\temail me@example.com\n}\n\n" + SIMPLE
+assert kinds(OTHER_GLOBAL)[0] == "global", kinds(OTHER_GLOBAL)
+assert app.render_document(app.parse_document(OTHER_GLOBAL)) == OTHER_GLOBAL
+MATCHER_L4 = "{\n\tlayer4 {\n\t\t:443 {\n\t\t\t@a tls\n\t\t\troute @a {\n\t\t\t\tproxy x:1\n\t\t\t}\n\t\t}\n\t}\n}\n"
+assert kinds(MATCHER_L4)[0] == "global", kinds(MATCHER_L4)
+
+# Inserting a fresh layer4 block in front of an existing file produces a
+# document that parses back with the server and every original route.
+doc = app.parse_document(TWO)
+doc[0:0] = [{"kind": "layer4", "prefix": "", "servers": [{"listen": ":25565", "upstream": "h:25565"}]},
+            {"kind": "text", "raw": "\n\n"}]
+reparsed = app.parse_document(app.render_document(doc))
+assert reparsed[0]["kind"] == "layer4" and [s["kind"] for s in reparsed].count("managed") == 2, reparsed
+
+# Form validation.
+assert app.normalize_listen("25565") == ":25565"
+assert app.validate_tcp_form(":25565", "192.168.1.115:25565", []) is None
+assert app.validate_tcp_form(":25565", "192.168.1.115", []) is not None  # upstream needs a port
+assert app.validate_tcp_form(":443", "x:1", []) is not None
+assert app.validate_tcp_form(":99999", "x:1", []) is not None
+assert app.validate_tcp_form(":25565", "x:1", app.parse_document(L4)) is not None  # duplicate port
+assert app.validate_tcp_form(":25565", "x:1", app.parse_document(L4), skip_idx=0) is None
+
 print("All parser tests passed.")
